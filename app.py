@@ -132,15 +132,27 @@ def health():
 def _shape_products() -> list[dict]:
     """Return the latest scrape result with the full per-product field set."""
     result = _state.get("last_result") or {}
+    products_list = result.get("products", [])
+
+    # Extract titles and fetch order history from Salesforce in bulk
+    titles = [p.get("title") for p in products_list if p.get("title")]
+    from salesforce_sync import get_bulk_order_history
+    history_map = get_bulk_order_history(titles) if titles else {}
+
     out = []
-    for p in result.get("products", []):
+    for p in products_list:
+        title = p.get("title")
         # Tolerate legacy keys from older orders_report.json files.
         date = p.get("last_ordered_date") or p.get("purchase_date")
         count = p.get("number_of_times_purchased")
         if count is None:
             count = p.get("purchase_count_in_last_10_orders")
+
+        # Get history
+        order_history = history_map.get(title) or {"total_purchases": 0, "history": []}
+
         out.append({
-            "product_name": p.get("title"),
+            "product_name": title,
             "date": date,
             "number_of_times_purchased": count,
             "current_price": p.get("current_price"),
@@ -149,8 +161,11 @@ def _shape_products() -> list[dict]:
             "image_url": p.get("image_url"),
             "category": p.get("category"),
             "availability": p.get("availability"),
+            "rating": p.get("rating"),
             "source": p.get("source"),
             "scraped_at": p.get("scraped_at"),
+            "weight": p.get("weight"),
+            "order_history": order_history,
         })
     return out
 
@@ -403,6 +418,16 @@ def api_search():
     try:
         from amazon_search import search_amazon_now
         products = asyncio.run(search_amazon_now(query, headless=_headless()))
+        
+        # Enrich search results with Salesforce order history
+        if products:
+            from salesforce_sync import get_bulk_order_history
+            search_titles = [p.get("product_name") for p in products if p.get("product_name")]
+            history_map = get_bulk_order_history(search_titles) if search_titles else {}
+            for p in products:
+                title = p.get("product_name")
+                p["order_history"] = history_map.get(title) or {"total_purchases": 0, "history": []}
+
         _search_state["last_result"] = products
         _search_state["error"] = None
         _search_state["last_run_at"] = datetime.now(tz=timezone.utc).isoformat()
@@ -881,9 +906,12 @@ _OPENAPI_SPEC = {
                     "image_url":                 {"type": "string", "nullable": True, "example": "https://m.media-amazon.com/images/..."},
                     "category":                  {"type": "string", "nullable": True, "example": "Grocery"},
                     "availability":              {"type": "string", "nullable": True, "example": "Available"},
+                    "rating":                    {"type": "number", "nullable": True, "example": 4.3},
                     "source":                    {"type": "string", "nullable": True, "example": "Amazon Fresh",
                                                   "description": "\"Amazon Now\" or \"Amazon Fresh\", per product origin."},
                     "scraped_at":                {"type": "string", "format": "date-time", "nullable": True},
+                    "weight":                    {"type": "string", "nullable": True, "example": "500 gm"},
+                    "order_history":             {"$ref": "#/components/schemas/OrderHistory"},
                 },
             },
             "CartRequest": {
@@ -949,7 +977,7 @@ _OPENAPI_SPEC = {
                     "added":      {"type": "array", "items": {"$ref": "#/components/schemas/CartItem"}},
                     "not_found":  {"type": "array", "items": {"$ref": "#/components/schemas/NotFoundItem"}},
                     "cart_count": {"type": "integer", "example": 5,
-                                   "description": "Total items in the main/Fresh cart after the run (nav badge)."},
+                                    "description": "Total items in the main/Fresh cart after the run (nav badge)."},
                     "now_cart_count": {"type": "integer", "nullable": True, "example": 2,
                                        "description": "Items in the separate Amazon Now cart; null when not readable."},
                     "added_at":   {"type": "string", "format": "date-time"},
@@ -975,6 +1003,25 @@ _OPENAPI_SPEC = {
                     "rating": {"type": "number", "nullable": True, "example": 4.3},
                     "scraped_at": {"type": "string", "format": "date-time", "example": "2026-06-28T18:02:18.457Z"},
                     "source": {"type": "string", "enum": ["Amazon Now", "Amazon Fresh"], "example": "Amazon Now"},
+                    "weight": {"type": "string", "nullable": True, "example": "500 gm"},
+                    "order_history": {"$ref": "#/components/schemas/OrderHistory"}
+                }
+            },
+            "OrderHistory": {
+                "type": "object",
+                "properties": {
+                    "total_purchases": {"type": "integer", "example": 2},
+                    "history": {
+                        "type": "array",
+                        "items": {"$ref": "#/components/schemas/HistoryEntry"}
+                    }
+                }
+            },
+            "HistoryEntry": {
+                "type": "object",
+                "properties": {
+                    "date": {"type": "string", "example": "2026-06-25"},
+                    "price": {"type": "number", "nullable": True, "example": 35.0},
                     "weight": {"type": "string", "nullable": True, "example": "500 gm"}
                 }
             },
